@@ -1,0 +1,128 @@
+version: '3.8'
+
+services:
+  # MySQL数据库
+  mysql:
+    image: mysql:8.0
+    container_name: tophub-mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: tophub123
+      MYSQL_DATABASE: tophub
+      MYSQL_USER: tophub
+      MYSQL_PASSWORD: tophub123
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./database/mysql/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./database/mysql/schema.sql:/docker-entrypoint-initdb.d/02-schema.sql
+      - ./database/mysql/data.sql:/docker-entrypoint-initdb.d/03-data.sql
+    ports:
+      - "3306:3306"
+    networks:
+      - tophub-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  # MongoDB数据库
+  mongodb:
+    image: mongo:7.0
+    container_name: tophub-mongodb
+    restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: tophub123
+      MONGO_INITDB_DATABASE: tophub
+    volumes:
+      - mongodb_data:/data/db
+      - ./database/mongodb/init.js:/docker-entrypoint-initdb.d/init.js
+      - ./database/mongodb/collections.js:/docker-entrypoint-initdb.d/collections.js
+    ports:
+      - "27017:27017"
+    networks:
+      - tophub-network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # Redis缓存
+  redis:
+    image: redis:7.2-alpine
+    container_name: tophub-redis
+    restart: always
+    command: redis-server --appendonly yes --requirepass tophub123
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - tophub-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Elasticsearch
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: tophub-elasticsearch
+    restart: always
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - tophub-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # RabbitMQ消息队列
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: tophub-rabbitmq
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: tophub
+      RABBITMQ_DEFAULT_PASS: tophub123
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - tophub-network
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 30s
+      timeout: 30s
+      retries: 3
+
+volumes:
+  mysql_data:
+    driver: local
+  mongodb_data:
+    driver: local
+  redis_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+
+networks:
+  tophub-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

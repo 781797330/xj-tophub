@@ -1,0 +1,280 @@
+name: 信笺TopHub CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  DOCKER_REGISTRY: registry.tophub.com
+  PROJECT_NAME: tophub
+
+jobs:
+  # 代码质量检查
+  code-quality:
+    runs-on: ubuntu-latest
+    name: 代码质量检查
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+      
+    - name: 设置Java环境
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        
+    - name: 设置Node.js环境
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: frontend/web/package-lock.json
+        
+    - name: 缓存Maven依赖
+      uses: actions/cache@v3
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+        
+    - name: 后端代码检查
+      run: |
+        cd backend
+        mvn clean compile checkstyle:check spotbugs:check
+        
+    - name: 前端代码检查
+      run: |
+        cd frontend/web
+        npm ci
+        npm run lint
+        npm run type-check
+        
+    - name: 安全扫描
+      run: |
+        cd backend
+        mvn org.owasp:dependency-check-maven:check
+        
+  # 单元测试
+  unit-tests:
+    runs-on: ubuntu-latest
+    name: 单元测试
+    needs: code-quality
+    
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: tophub_test
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+          
+      mongodb:
+        image: mongo:7.0
+        env:
+          MONGO_INITDB_ROOT_USERNAME: test
+          MONGO_INITDB_ROOT_PASSWORD: test
+        ports:
+          - 27017:27017
+          
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6379:6379
+        options: --health-cmd="redis-cli ping" --health-interval=10s --health-timeout=5s --health-retries=3
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+      
+    - name: 设置Java环境
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        
+    - name: 设置Node.js环境
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: frontend/web/package-lock.json
+        
+    - name: 缓存Maven依赖
+      uses: actions/cache@v3
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+        
+    - name: 运行后端单元测试
+      run: |
+        cd backend
+        mvn clean test
+        
+    - name: 运行前端单元测试
+      run: |
+        cd frontend/web
+        npm ci
+        npm test -- --coverage --watchAll=false
+        
+    - name: 上传测试覆盖率报告
+      uses: codecov/codecov-action@v3
+      with:
+        files: ./backend/target/site/jacoco/jacoco.xml,./frontend/web/coverage/lcov.info
+        flags: unittests
+        name: codecov-umbrella
+        
+  # 构建Docker镜像
+  build-images:
+    runs-on: ubuntu-latest
+    name: 构建Docker镜像
+    needs: unit-tests
+    if: github.event_name == 'push'
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+      
+    - name: 设置Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: 登录Docker Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.DOCKER_REGISTRY }}
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+        
+    - name: 设置Java环境
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        
+    - name: 设置Node.js环境
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: frontend/web/package-lock.json
+        
+    - name: 缓存Maven依赖
+      uses: actions/cache@v3
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+        
+    - name: 构建后端服务
+      run: |
+        cd backend
+        mvn clean package -DskipTests
+        
+    - name: 构建前端应用
+      run: |
+        cd frontend/web
+        npm ci
+        npm run build
+        
+    - name: 提取元数据
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.DOCKER_REGISTRY }}/${{ env.PROJECT_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=raw,value=latest,enable={{is_default_branch}}
+          
+    - name: 构建并推送用户服务镜像
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend/user-service
+        push: true
+        tags: ${{ env.DOCKER_REGISTRY }}/${{ env.PROJECT_NAME }}-user-service:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: 构建并推送内容服务镜像
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend/content-service
+        push: true
+        tags: ${{ env.DOCKER_REGISTRY }}/${{ env.PROJECT_NAME }}-content-service:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: 构建并推送AI服务镜像
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend/ai-service
+        push: true
+        tags: ${{ env.DOCKER_REGISTRY }}/${{ env.PROJECT_NAME }}-ai-service:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: 构建并推送推荐服务镜像
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend/recommendation-service
+        push: true
+        tags: ${{ env.DOCKER_REGISTRY }}/${{ env.PROJECT_NAME }}-recommendation-service:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: 构建并推送通知服务镜像
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend/notification-service
+        push: true
+        tags: ${{ env.DOCKER_REGISTRY }}/${{ env.PROJECT_NAME }}-notification-service:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: 构建并推送网关服务镜像
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend/gateway
+        push: true
+        tags: ${{ env.DOCKER_REGISTRY }}/${{ env.PROJECT_NAME }}-gateway:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: 构建并推送前端应用镜像
+      uses: docker/build-push-action@v5
+      with:
+        context: ./frontend/web
+        push: true
+        tags: ${{ env.DOCKER_REGISTRY }}/${{ env.PROJECT_NAME }}-web:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # 部署到生产环境
+  deploy-production:
+    runs-on: ubuntu-latest
+    name: 部署到生产环境
+    needs: build-images
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: production
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+      
+    - name: 部署到生产环境
+      run: |
+        chmod +x scripts/build-and-deploy.sh
+        scripts/build-and-deploy.sh ${{ github.ref_name }} production
+      env:
+        DOCKER_REGISTRY: ${{ env.DOCKER_REGISTRY }}
+        DEPLOY_USER: ${{ secrets.PRODUCTION_DEPLOY_USER }}
+        DEPLOY_HOST: ${{ secrets.PRODUCTION_DEPLOY_HOST }}
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
